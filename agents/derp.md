@@ -26,6 +26,29 @@ Network correlation (more reliable): attach the extraction pass to your existing
 Trigger timing for SPA extraction
 
 Since forms can be conditionally rendered (multi-step wizards, modals, tab panels), a single extraction pass on page load isn't enough:
+Re-run extraction after every navigation-equivalent event: route change (listen for History API pushState/replaceState + popstate), DOM mutation bursts (MutationObserver debounced ~300-500ms), and after any of your agent's own interactions (click, focus) settle
+This ties naturally into your existing coverage/state model in lemi4 — treat "new form discovered" as a coverage-relevant state transition, same as a new URL
+
+Unified output schema
+
+Whatever the source, normalize to one structure so downstream (your WALL gateway, IDOR testing lanes, payload injection) doesn't care how the form was found:
+
+json
+{
+  "form_id": "stable-hash-of-dom-path-or-endpoint",
+  "discovery_method": "static_dom | network_correlated",
+  "submit_target": {"url": "...", "method": "POST", "content_type": "application/json"},
+  "fields": [
+    {"name": "...", "type": "...", "required": true, "constraints": {...}, "label": "..."}
+  ],
+  "page_context": {"url": "...", "route": "..."}
+}
+
+discovery_method matters for your completion contract — if a form was only discoverable via network correlation, you know static crawling alone would've missed it, which is useful signal for coverage confidence scoring.
+
+One gotcha worth flagging
+
+Re-running full-DOM extraction on every mutation is expensive at scale. Debounce it, and scope the MutationObserver to meaningful subtrees rather than the whole document.body if you can identify an app root (#root, #app) — cuts a lot of noise from unrelated UI churn (toasts, animations) triggering unnecessary re-extraction passes.
 
 Re-run extraction after every navigation-equivalent event: route change (listen for History API pushState/replaceState + popstate), DOM mutation bursts (MutationObserver debounced ~300-500ms), and after any of your agent's own interactions (click, focus) settle
 This ties naturally into your existing coverage/state model in lemi4 — treat "new form discovered" as a coverage-relevant state transition, same as a new URL
