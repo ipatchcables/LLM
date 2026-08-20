@@ -1,25 +1,11 @@
-1. Deterministic control flow over model-owned flow, where possible
-The more decision-making you push into the LLM's own reasoning loop, the more you're at the mercy of hallucinated tool calls, skipped steps, and non-reproducible runs. A pattern like lemi4's — model proposes, but a deterministic gateway/state machine actually decides what's allowed — tends to age much better than a "let the model figure out the whole loop" design. You've already landed on this with the WALL gateway and closed action vocabulary, and it's the right instinct.
+1. Immutable state / copy-on-write (the standard fix, and what LangGraph does)
+Instead of the orchestrator mutating a shared state object in place, every write produces a new state object (or a new version of the relevant key) rather than modifying the old one. The observer holds a reference to whatever version existed at the moment it read — that reference never changes underneath it, because nothing is mutated in place. This is exactly how LangGraph's state works: reducers produce new state at each step rather than mutating a shared dict, and checkpoints give you a versioned, immutable snapshot at each superstep. An observer subscribing to state updates always gets a complete, self-consistent snapshot — never torn — because there's no in-place mutation to be caught mid-write. Staleness still exists (the observer might be one step behind), but it's never inconsistent.
 
-2. A narrow, well-typed action/tool vocabulary
-Orchestrators fail most often not because the model reasons badly, but because it has too many ways to express intent and the parser/dispatcher has to guess. Closed vocabularies (enum-like actions, structured args) beat open-ended "call any tool with any JSON" schemes for reliability and auditability — especially for security tooling where you need replayability.
+2. Versioned/sequenced state with explicit staleness detection
+Attach a monotonic version number or logical clock to state. The observer records the version it last read; if it reads again and the version hasn't changed, it knows it's looking at the same snapshot; if it jumps, it knows how far behind it might be. This turns "possibly stale" into "known-stale-by-N-steps," which you can then gate on — e.g., an observer enforcing a security invariant might explicitly refuse to make a judgment if it's more than 1 version behind, rather than silently acting on old data.
 
-3. Explicit state, not implicit conversation history
-Raw chat history as "state" balloons context and buries the signal. A structured state object (current phase, findings so far, coverage map, budget remaining) that gets handed to each subagent/turn is both more token-efficient and easier to reason about failure from. This lines up with your 32K-context / structured-state recommendation for payload-gen agents.
+3. Event log / append-only stream instead of reading mutable state directly
+Rather than the observer polling a shared mutable object, the orchestrator emits events (append-only) and the observer subscribes to the stream. The observer's view is always "everything up to event N," which is inherently consistent — you can never read a torn event, only a complete or not-yet-arrived one. This is the strongest pattern if the observer's job is to watch for policy violations or anomalies in near-real-time, because it also gives you a natural audit trail — relevant if the observer is effectively your gateway's compliance/monitoring layer.
 
-4. Hard boundaries between planning and execution
-Planner/executor separation isn't just a context-window optimization — it's a safety and debuggability boundary. The planner never sees raw HTTP traffic; the executor never makes strategic decisions. When something goes wrong, you know which layer to look at.
-
-5. A completion/coverage contract
-Orchestrators without a defined "done" condition tend to either loop forever or quit early having covered 20% of the surface. Your completion contract in lemi4 (coverage guarantees) is doing real work here — it's the difference between "the agent stopped" and "the agent finished."
-
-6. Deny-by-default gateways for anything destructive
-Especially relevant for security testing agents: any action with side effects (state-changing requests, destructive IDOR tests) needs to pass through a gate that defaults to deny, not one that defaults to allow-unless-flagged. Chokepoint architecture over scattered checks — one place to audit, one place to change policy.
-
-7. Subagent delegation with narrow scope, not general-purpose subagents
-spawn_subtask-style delegation works best when each specialist has a tightly scoped mandate (e.g., "confirm this SQLi finding" not "explore this app"). General-purpose subagents reintroduce all the control-flow problems you solved at the top level, just one layer down.
-
-8. Observability/replay
-For anything you'll need to put in a client report, being able to reconstruct why the orchestrator made a decision (which state, which action, which gateway rule fired) matters as much as the decision itself.
-
-If you want, I can look at this against lemi4's actual architecture specifically — e.g., where the model-owned control flow and the deterministic WALL gateway might be fighting each other, or how the completion contract interacts with subagent delegation boundaries.
+4. Reader-writer locking (avoid if you can)
+asyncio.Lock/asyncio.Condition around state access technically prevents torn reads, but it reintroduces blocking — the whole point of going async was concurrency, and a lock serializes exactly the thing you wanted to overlap. Fine for low-frequency state (e.g., a budget counter checked once per subtask), bad for anything the orchestrator touches on every step.
