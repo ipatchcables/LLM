@@ -21,3 +21,11 @@ Common in SPA CRUD UIs — fields plus an onClick handler on a <button type="but
 
 Structural heuristic: cluster inputs that share a common DOM ancestor within N levels, with a trailing button-like element (role="button", <button>, or clickable div with submit-ish text) as the completion action.
 Network correlation (more reliable): attach the extraction pass to your existing network observer. When a button is clicked and it triggers a state-changing XHR/fetch/GraphQL mutation shortly after, retroactively tag the input cluster you interacted with as the "form" and record the actual submission endpoint, method, and payload shape from the intercepted request — this is strictly more accurate than the action/method attributes because SPAs often don't set them meaningfully anyway.
+
+
+Trigger timing for SPA extraction
+
+Since forms can be conditionally rendered (multi-step wizards, modals, tab panels), a single extraction pass on page load isn't enough:
+
+Re-run extraction after every navigation-equivalent event: route change (listen for History API pushState/replaceState + popstate), DOM mutation bursts (MutationObserver debounced ~300-500ms), and after any of your agent's own interactions (click, focus) settle
+This ties naturally into your existing coverage/state model in lemi4 — treat "new form discovered" as a coverage-relevant state transition, same as a new URL
