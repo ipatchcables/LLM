@@ -1,31 +1,23 @@
-1. Context isolation matches your own context-sizing findings
-You'd already converged on planner/executor separation being the most impactful context reduction strategy, with 32K as the sweet spot. A monolithic "do everything" agent has to hold XSS payload knowledge, SQLi syntax variants, SSRF bypass techniques, and IDOR heuristics all in context simultaneously, plus the raw HTTP traffic from testing all of them. A dedicated XSS subagent only needs XSS-relevant context — sink types, encoding contexts, CSP bypass patterns — which is a much smaller, denser, more relevant window. This isn't just cost savings; a smaller, more focused context tends to produce better payload selection because the model isn't diluting attention across unrelated vulnerability classes.
+Good question — this splits into two extraction problems that converge on one schema, and the trick is doing DOM-based extraction for both rather than treating static HTML parsing and SPA extraction as separate code paths.
 
-2. Vulnerability classes have genuinely different decision trees
-XSS testing is fundamentally about output context (HTML body vs attribute vs JS string vs URL) driving payload shape. SQLi is about injection point + DB backend + error visibility driving technique (error-based vs blind vs time-based). These aren't just "different payloads," they're different reasoning strategies — different signals to look for, different confirmation methods, different false-positive patterns. Cramming both into one agent's system prompt means either bloating it with conditional logic ("if testing XSS, do X; if testing SQLi, do Y") or accepting worse decisions from a generalist trying to do both reasoning styles at once.
+Why not parse raw HTML with BeautifulSoup/lxml
 
-3. It maps cleanly onto your gateway/policy model
-A per-vuln-class subagent gives you a natural place to scope the WALL gateway's allowed-action set tightly — the SQLi subagent's action vocabulary doesn't need to include DOM manipulation payloads, and vice versa. Tighter allowed-action sets per subagent is a smaller attack surface for the gateway to reason about and a smaller blast radius if a subagent misbehaves (prompt injection from a malicious response, say) — it can only misuse the tools it was scoped, which is the same "capability-not-credential discipline at the tool layer" principle you'd already landed on for the LangGraph crawler.
+For traditional server-rendered forms this works fine, but it breaks down for SPAs where forms are constructed by JS after load (React controlled inputs, Vue v-model, dynamically injected <select> options, shadow DOM web components). If your crawler has a "static HTML mode" and a "SPA mode" as separate extractors, you get drift — two code paths to maintain, two sets of bugs, and edge cases (a Django app with a sprinkle of Alpine.js) that don't cleanly belong to either.
 
-4. Specialization is independently testable and independently improvable
-This is the practical payoff: you can eval, tune, and version the XSS subagent against a golden set of known-XSS-vulnerable test apps without touching the SQLi subagent at all. Given you're already doing replay-equivalence testing (the lemi SQLi detection work), a monolithic agent makes it much harder to isolate why a regression happened — was it the SQLi logic or did an unrelated prompt change hurt XSS detection as a side effect?
+Better approach: always extract from the rendered DOM via Playwright/CDP, never from raw response bodies. Since you're already using Playwright as executor in lemi4/deepagent3, this is just "run the same extraction routine after networkidle or a stability heuristic, regardless of whether the page was server-rendered or client-rendered." Static HTML becomes a degenerate case of SPA extraction — it's a DOM state that happened not to need JS to reach.
 
-Where you don't want full fragmentation:
+Core extraction routine (via page.evaluate)
 
-Don't split by vuln class if the vuln classes overlap heavily in mechanism. SSRF and IDOR-via-URL-manipulation share a lot of "does this parameter control server-side resource resolution" reasoning — splitting those into fully separate subagents can cause redundant discovery work (both probing the same parameter independently) or missed compound findings (an SSRF that's exploitable because of an IDOR). Group by shared reasoning pattern, not strictly by CWE/OWASP category.
-Don't spawn a subagent per class unconditionally — that's wasted concurrency budget and cost if the target surface obviously has no injection points at all (e.g., a purely static site). The planner should decide which specialist subagents are worth spawning based on a cheap initial recon pass (parameter discovery, tech-stack fingerprinting), not fan out all specialists against everything by default.
-Share a common finding schema and coverage tracker across all subagents, even though they're specialized — this is exactly the deterministic state layer from the LangGraph discussion. The specialization should be in the reasoning (planner routing + per-class subagent prompts/tools), not duplicated in the bookkeeping (coverage, completion contract, report formatting), or you end up reimplementing that logic N times with N chances to diverge.
+Walk the DOM (including shadow roots, and same-origin iframes recursively) and pull:
 
-Concretely, the shape I'd build:
+form elements: action, method, enctype, name/id
+All descendant inputs whether or not they're inside a <form> tag — SPAs frequently build "forms" as plain <div> wrappers with a JS-bound submit handler on a button, no <form> element at all
+For each field: tag, type, name, id, associated <label> (via for, wrapping, or aria-label/aria-labelledby), placeholder, required, pattern, maxlength, current value, and for select/radio/checkbox groups, the full option set
+Framework fingerprints where useful: React sets __reactProps$* / fiber keys on the DOM node, Vue attaches __vue__/_vnode — detecting these tells you the field is controlled by JS state rather than being a dumb input, which matters for how you'll interact with it later (native fill() vs dispatching input events so React's synthetic event system picks it up)
+Client-side validation hints: pattern, required, plus a lightweight static scan of associated <script>/bundle for validation library signatures if you want to get fancy (probably overkill for v1)
+Handling the "form" that has no submit button
 
-Planner (generalist, deterministic-ish routing)
-  ├── recon pass → identifies candidate injection points, tech stack, input surfaces
-  ├── routes to relevant specialists based on recon, not blind fan-out
-  │
-  ├── XSS subagent (specialized: reflected/stored/DOM sink analysis)
-  ├── SQLi subagent (specialized: error/blind/time-based by DB backend)
-  ├── SSRF/IDOR subagent (grouped: shared "server-side resource resolution" reasoning)
-  ├── Deserialization subagent (specialized: language/framework-specific gadget chains)
-  │
-  └── shared: coverage tracker, completion contract, WALL gateway (scoped per-subagent
-      allowed-actions), finding schema
+Common in SPA CRUD UIs — fields plus an onClick handler on a <button type="button"> that fires an XHR/fetch. Two options:
+
+Structural heuristic: cluster inputs that share a common DOM ancestor within N levels, with a trailing button-like element (role="button", <button>, or clickable div with submit-ish text) as the completion action.
+Network correlation (more reliable): attach the extraction pass to your existing network observer. When a button is clicked and it triggers a state-changing XHR/fetch/GraphQL mutation shortly after, retroactively tag the input cluster you interacted with as the "form" and record the actual submission endpoint, method, and payload shape from the intercepted request — this is strictly more accurate than the action/method attributes because SPAs often don't set them meaningfully anyway.
